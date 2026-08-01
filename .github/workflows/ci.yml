@@ -1,0 +1,125 @@
+# PR CI gate — pipeline-design-spec §3.2–3.7 (enforce-late, shift-left).
+#
+# Four cheap STATIC jobs run in parallel first (secret / SAST / SCA / lint);
+# the expensive BUILD + image scan runs only after all four pass (`needs:`),
+# so we never waste a build on code that would have failed anyway (§1 fail-fast,
+# §3.5 "after all static checks pass"). Nothing is published here — publication
+# is strictly post-gate (§3.8, APP-004).
+#
+# Each job below is a separate status check; making them REQUIRED (plus human
+# review) is done in the repo's branch-protection settings, not here — that is
+# what turns "the workflow ran" into "the merge is gated" (§3.7).
+#
+# Hardening follow-up: third-party actions are pinned to tags for readability;
+# pinning to commit SHAs is the stronger form (a moved tag can't swap the
+# action out from under us) — same tag-vs-digest trade as the Dockerfile base.
+
+name: CI (PR gate)
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Least-privilege default token.
+permissions:
+  contents: read
+
+# One in-flight run per PR; cancel superseded pushes to save minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --- §3.2 CI secret scan (the un-bypassable twin of the APP-002 pre-commit hook).
+  secret-scan:
+    name: Secret scan (Gitleaks §3.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so Gitleaks scans all commits on the PR
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Free for personal/public repos. An ORG-owned repo would need
+          # GITLEAKS_LICENSE — this repo is personal, so no license required.
+
+  # --- §3.3 SAST (source-level insecure patterns).
+  sast:
+    name: SAST (Semgrep §3.3)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep scan
+        # --error makes findings exit non-zero (blocks the PR). Community rule
+        # packs, no token needed. Add/remove packs to tune signal.
+        run: semgrep scan --config p/default --config p/security-audit --error
+
+  # --- §3.3 SCA (known-vulnerable dependencies).
+  sca:
+    name: SCA (OWASP Dependency-Check §3.3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Cache the NVD database so only the first run pays the full download.
+      - name: Cache NVD data
+        uses: actions/cache@v4
+        with:
+          path: ~/.dependency-check
+          key: depcheck-nvd-${{ runner.os }}
+      - name: Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@1.1.0
+        with:
+          project: sddp-backend
+          path: backend
+          format: HTML
+          # --failOnCVSS 7 = fail the job on any HIGH/CRITICAL finding.
+          # NVD_API_KEY is required for a usable NVD sync speed — set it as a
+          # repo secret (see handoff). Without it this job is very slow / flaky.
+          args: >-
+            --failOnCVSS 7
+            --nvdApiKey ${{ secrets.NVD_API_KEY }}
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: reports
+
+  # --- §3.4 Dockerfile lint ("is this image built to run insecurely?").
+  dockerfile-lint:
+    name: Dockerfile lint (Hadolint §3.4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: backend/Dockerfile
+
+  # --- §3.5 build ONCE + §3.6 image scan. Gated behind all static checks.
+  build-scan:
+    name: Build once + image scan (Trivy §3.5–3.6)
+    needs: [secret-scan, sast, sca, dockerfile-lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (once, §3.5)
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          push: false # publication is post-gate only (§3.8 / APP-004)
+          load: true # load into the runner's docker daemon so Trivy can scan it
+          tags: sddp-backend:ci
+      - name: Trivy image scan (§3.6)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: sddp-backend:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true # don't block on CVEs with no available fix
+          exit-code: "1" # findings fail the job → block the gate
+          vuln-type: os,library
