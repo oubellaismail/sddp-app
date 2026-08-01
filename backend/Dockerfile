@@ -1,25 +1,27 @@
 # syntax=docker/dockerfile:1
 #
-# Secure-by-default image for the SDDP backend. Aims to pass Hadolint clean and
-# satisfy POL-02 (runs non-root). Pinned base tag; digest-pinning is the
-# stronger form and a Week-3 / POL-04 hardening step.
-FROM node:20.18.1-slim
+# Multi-stage build. The runtime image is DISTROLESS: only the Node runtime and
+# our app — no npm, no shell, no package managers, minimal OS packages. This
+# structurally removes the base image's npm-bundled CVEs (tar/minimatch/glob/…)
+# and nearly all OS-package CVEs a full node:*-slim image carries, shrinks the
+# attack surface, and runs as a non-root user (satisfies POL-02).
+# Node 22 = current active LTS (Node 20 is reaching end-of-life).
+#
+# Base images are tag-pinned here; digest-pinning is the stronger form and a
+# POL-04 / Week-3 hardening step.
 
+# --- build: install production deps from the committed lockfile (build-once, ADR-004).
+FROM node:22-slim AS build
 WORKDIR /app
-
-# Install production dependencies from the committed lockfile for reproducible,
-# build-once artifacts (ADR-004). npm ci fails if package-lock.json is missing
-# or out of sync — exactly the guarantee we want.
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npm ci --omit=dev
 
-# Application source (copied after deps so dependency layers stay cached).
+# --- runtime: distroless Node, non-root (uid 65532), no shell / package managers.
+FROM gcr.io/distroless/nodejs22-debian12:nonroot
+WORKDIR /app
+COPY --from=build /app/node_modules ./node_modules
 COPY src ./src
-
-# Drop to the image's built-in non-root user (uid 1000). /app stays root-owned
-# and the app only reads it — no writable app dir, which also plays well with a
-# read-only root filesystem later.
-USER node
-
+USER nonroot
 EXPOSE 3000
-CMD ["node", "src/server.js"]
+# The distroless nodejs image's ENTRYPOINT is `node`; CMD is the script it runs.
+CMD ["/app/src/server.js"]
