@@ -3,6 +3,11 @@
 const express = require('express');
 const { Pool } = require('pg');
 
+// CSRF middleware is intentionally absent: this is a stateless JSON API with
+// GET-only routes and no cookie/session auth, so CSRF — which abuses ambient
+// browser cookies against state-changing requests — does not apply. Revisit if
+// authenticated, state-changing endpoints are added.
+// nosemgrep: javascript.express.security.audit.express-check-csurf-middleware-usage.express-check-csurf-middleware-usage
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
