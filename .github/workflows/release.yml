@@ -1,0 +1,131 @@
+# Release — sign & promote (runs post-merge, i.e. post-gate).
+#
+# On merge to main, the exact image that was built and scanned on the PR is
+# signed and promoted — never rebuilt. Trust acts happen only here, after the
+# full gate (all checks + merge) has passed: sign an artifact any earlier and
+# we'd be certifying trust that hasn't been earned yet.
+#
+# Flow: resolve the scanned digest -> SBOM -> keyless sign + attest -> copy the
+# signed digest (with signature + attestations) from the staging registry to the
+# production registry, then verify. Staging holds unsigned build/scan artifacts;
+# the production registry receives ONLY signed digests and is the only registry
+# the cluster pulls from.
+#
+# Keyless signing (Sigstore): the workflow's OIDC identity gets a short-lived
+# Fulcio certificate and the signing event is logged in Rekor — no long-lived
+# private key. Admission verification later pins this exact identity (issuer +
+# subject), so keep the workflow filename/ref stable.
+#
+# Actions are pinned to commit SHAs — a moved tag can't swap the action out.
+
+name: Release (sign & promote)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: "Commit SHA whose staging image to sign/promote (defaults to auto-resolving from the merge commit's PR)"
+        required: false
+
+permissions:
+  contents: read
+
+# Never cancel a release mid-sign; let each merge finish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sign-promote:
+    name: Sign & promote to production registry
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # read the staging image + write signature/attestation artifacts alongside it
+      id-token: write # keyless OIDC signing (Fulcio short-lived cert)
+      pull-requests: read # resolve the merge commit's PR -> head SHA
+    env:
+      STAGING: ghcr.io/${{ github.repository_owner }}/sddp-backend
+      PROD: registry.digitalocean.com/sddp-registry/sddp-backend
+    steps:
+      - name: Log in to staging registry (GHCR)
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Resolve the EXACT digest built + scanned on the PR. A merge/squash makes
+      # a new commit SHA, so github.sha won't match the PR's `sha-<head>` tag —
+      # recover the head SHA from the merge commit's associated PR, then look up
+      # the immutable digest for that tag. No rebuild: content is addressed by
+      # digest, so this is provably the artifact that was scanned.
+      - name: Resolve scanned digest
+        id: digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Route context through env (never interpolate into the script body) —
+          # the dispatch input is user-controlled, so this avoids shell injection.
+          REPO: ${{ github.repository }}
+          MERGE_SHA: ${{ github.sha }}
+          INPUT_SHA: ${{ github.event.inputs.head_sha }}
+        run: |
+          HEAD_SHA="$INPUT_SHA"
+          if [ -z "$HEAD_SHA" ]; then
+            PR=$(gh api "repos/$REPO/commits/$MERGE_SHA/pulls" --jq '.[0].number // empty')
+            if [ -z "$PR" ]; then
+              echo "No PR associated with $MERGE_SHA — nothing to promote." >&2
+              exit 1
+            fi
+            HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
+          fi
+          DIGEST=$(docker buildx imagetools inspect "$STAGING:sha-$HEAD_SHA" --format '{{.Manifest.Digest}}')
+          {
+            echo "ref=$STAGING@$DIGEST"
+            echo "digest=$DIGEST"
+            echo "head_sha=$HEAD_SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved $STAGING:sha-$HEAD_SHA -> $DIGEST"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.digest.outputs.ref }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      # Sign the digest and attach the SBOM as a signed attestation. Both land in
+      # the staging registry next to the image; the copy step carries them along.
+      - name: Sign (keyless) + attest SBOM
+        env:
+          COSIGN_YES: "true" # non-interactive: consent to Rekor transparency-log entry
+        run: |
+          cosign sign "${{ steps.digest.outputs.ref }}"
+          cosign attest --type spdxjson --predicate sbom.spdx.json "${{ steps.digest.outputs.ref }}"
+
+      - name: Log in to production registry (DOCR)
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: registry.digitalocean.com
+          username: ${{ secrets.DOCR_TOKEN }} # DOCR uses the API token as both username and password
+          password: ${{ secrets.DOCR_TOKEN }}
+
+      # Promote: copy the signed digest + its signature and SBOM attestation to
+      # production. No re-sign — the signature travels, so it verifies identically
+      # against the same digest in production.
+      - name: Promote — copy signed digest to production
+        run: |
+          cosign copy "${{ steps.digest.outputs.ref }}" "$PROD:sha-${{ steps.digest.outputs.head_sha }}"
+
+      - name: Verify signature in production
+        run: |
+          cosign verify \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release.yml@" \
+            "$PROD@${{ steps.digest.outputs.digest }}"
+          echo "**Promoted (SIGNED):** \`$PROD@${{ steps.digest.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
