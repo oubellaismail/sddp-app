@@ -1,13 +1,13 @@
-# PR CI gate — pipeline-design-spec §3.2–3.7 (enforce-late, shift-left).
+# PR CI gate — enforce-late, shift-left.
 #
 # Four cheap STATIC jobs run in parallel first (secret / SAST / SCA / lint);
 # the expensive BUILD + image scan runs only after all four pass (`needs:`),
-# so we never waste a build on code that would have failed anyway (§1 fail-fast,
-# §3.5 "after all static checks pass"). Nothing is published here — publication
-# is strictly post-gate (§3.8, APP-004).
+# so we never waste a build on code that would have failed anyway. Nothing is
+# published until after the whole gate is green — publication is strictly
+# post-gate (the publish steps live at the end of the build job).
 #
 # Each job below is a separate status check; making them REQUIRED (plus human
-# review) is done in the repo's branch-protection settings, not here (§3.7).
+# review) is done in the repo's branch-protection settings, not here.
 #
 # Actions are pinned to commit SHAs (not tags) — a moved tag can't swap the
 # action out from under us. Our own Semgrep SAST enforces this on this file.
@@ -29,9 +29,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # --- §3.2 CI secret scan (the un-bypassable twin of the APP-002 pre-commit hook).
+  # --- CI secret scan (the un-bypassable twin of the local pre-commit hook).
   secret-scan:
-    name: Secret scan (Gitleaks §3.2)
+    name: Secret scan (Gitleaks)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -46,9 +46,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Free for personal/public repos; an ORG repo would need GITLEAKS_LICENSE.
 
-  # --- §3.3 SAST (source-level insecure patterns).
+  # --- SAST (source-level insecure patterns).
   sast:
-    name: SAST (Semgrep §3.3)
+    name: SAST (Semgrep)
     runs-on: ubuntu-latest
     container:
       image: semgrep/semgrep
@@ -59,9 +59,9 @@ jobs:
         # packs, no token needed. Add/remove packs to tune signal.
         run: semgrep scan --config p/default --config p/security-audit --error
 
-  # --- §3.3 SCA (known-vulnerable dependencies).
+  # --- SCA (known-vulnerable dependencies).
   sca:
-    name: SCA (OWASP Dependency-Check §3.3)
+    name: SCA (OWASP Dependency-Check)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -89,9 +89,9 @@ jobs:
           name: dependency-check-report
           path: reports
 
-  # --- §3.4 Dockerfile lint ("is this image built to run insecurely?").
+  # --- Dockerfile lint ("is this image built to run insecurely?").
   dockerfile-lint:
-    name: Dockerfile lint (Hadolint §3.4)
+    name: Dockerfile lint (Hadolint)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -99,22 +99,27 @@ jobs:
         with:
           dockerfile: backend/Dockerfile
 
-  # --- §3.5 build ONCE + §3.6 image scan. Gated behind all static checks.
+  # --- Build ONCE + image scan + publish. Gated behind all static checks
+  # (needs:). Build once, promote by digest: the image Trivy scans is the
+  # *same* image we push to the registry — never a rebuild.
   build-scan:
-    name: Build once + image scan (Trivy §3.5–3.6)
+    name: Build once + scan + publish (Trivy)
     needs: [secret-scan, sast, sca, dockerfile-lint]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push the scanned digest to the staging registry (GHCR)
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Build image (once, §3.5)
+      - name: Build image (once)
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: backend
-          push: false # publication is post-gate only (§3.8 / APP-004)
+          push: false # not here — publication is post-gate (step below)
           load: true # load into the runner's docker daemon so Trivy can scan it
           tags: sddp-backend:ci
-      - name: Trivy image scan (§3.6)
+      - name: Trivy image scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: sddp-backend:ci
@@ -122,3 +127,29 @@ jobs:
           ignore-unfixed: true # don't block on CVEs with no available fix
           exit-code: "1" # findings fail the job → block the gate
           vuln-type: os,library
+
+      # --- Publish to the staging registry (GHCR). These steps run only on the
+      # pass path: `if: success()` is the default, and Trivy's exit-code:1 fails
+      # the job, so a failing gate publishes NOTHING. The image is UNSIGNED here
+      # = staging, not promoted: the cluster pulls only from the prod registry,
+      # never staging. The release/signing step later signs THIS digest and
+      # copies it to the prod registry — hence we push the exact image Trivy just
+      # scanned (build-once), keyed by content digest.
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push scanned digest to staging
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/sddp-backend"
+          # Tag by the real commit (head.sha); on pull_request github.sha is a
+          # throwaway test-merge. The DIGEST below is the true content identity.
+          TAG="sha-${{ github.event.pull_request.head.sha }}"
+          docker tag sddp-backend:ci "$IMAGE:$TAG"
+          docker push "$IMAGE:$TAG"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$TAG")
+          echo "**Published to staging (UNSIGNED = not promoted):**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tag: \`$IMAGE:$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: \`$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
