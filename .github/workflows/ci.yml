@@ -99,11 +99,16 @@ jobs:
         with:
           dockerfile: backend/Dockerfile
 
-  # --- §3.5 build ONCE + §3.6 image scan. Gated behind all static checks.
+  # --- §3.5 build ONCE + §3.6 image scan + §3.8 publish. Gated behind all static
+  # checks (needs:). Build once, promote by digest (ADR-004, retained by ADR-008):
+  # the image Trivy scans is the *same* image we push to GHCR — never a rebuild.
   build-scan:
-    name: Build once + image scan (Trivy §3.5–3.6)
+    name: Build once + scan + publish (Trivy §3.5–3.6, GHCR §3.8)
     needs: [secret-scan, sast, sca, dockerfile-lint]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push the scanned digest to GHCR staging (§3.8)
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -111,7 +116,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: backend
-          push: false # publication is post-gate only (§3.8 / APP-004)
+          push: false # not here — publication is post-gate (§3.8 step below)
           load: true # load into the runner's docker daemon so Trivy can scan it
           tags: sddp-backend:ci
       - name: Trivy image scan (§3.6)
@@ -122,3 +127,28 @@ jobs:
           ignore-unfixed: true # don't block on CVEs with no available fix
           exit-code: "1" # findings fail the job → block the gate
           vuln-type: os,library
+
+      # --- §3.8 Publish to GHCR staging. These steps run only on the pass path:
+      # `if: success()` is the default, and Trivy's exit-code:1 fails the job, so a
+      # failing gate publishes NOTHING (DoD). The image is UNSIGNED here = staging,
+      # not promoted (ADR-008): the cluster pulls only from DOCR (POL-04), never
+      # GHCR. Week-3 signs THIS digest and cosign-copies it to DOCR — hence we push
+      # the exact image Trivy just scanned (build-once), keyed by content digest.
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push scanned digest to staging (§3.8)
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/sddp-backend"
+          # Tag by the real commit (head.sha); on pull_request github.sha is a
+          # throwaway test-merge. The DIGEST below is the true content identity.
+          TAG="sha-${{ github.event.pull_request.head.sha }}"
+          docker tag sddp-backend:ci "$IMAGE:$TAG"
+          docker push "$IMAGE:$TAG"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$TAG")
+          echo "**Published to GHCR staging (UNSIGNED = not promoted):**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tag: \`$IMAGE:$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: \`$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
