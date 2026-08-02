@@ -95,6 +95,24 @@ jobs:
       - name: Install crane
         uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
 
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.digest.outputs.ref }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      # Sign + attest in STAGING first, so only a SIGNED artifact is ever
+      # promoted. Cosign writes the signature/attestation as sibling tags next to
+      # the image: sha256-<hex>.sig and sha256-<hex>.att.
+      - name: Sign (keyless) + attest SBOM
+        env:
+          COSIGN_YES: "true" # non-interactive: consent to Rekor transparency-log entry
+          STAGING_REF: ${{ steps.digest.outputs.ref }}
+        run: |
+          cosign sign "$STAGING_REF"
+          cosign attest --type spdxjson --predicate sbom.spdx.json "$STAGING_REF"
+
       - name: Log in to production registry (DOCR)
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
@@ -102,42 +120,33 @@ jobs:
           username: ${{ secrets.DOCR_TOKEN }} # DOCR uses the API token as both username and password
           password: ${{ secrets.DOCR_TOKEN }}
 
-      # Promote the IMAGE first (unsigned), then mint the signature directly on
-      # the production digest below. `crane cp` is a faithful copy that PRESERVES
-      # the digest, so the prod artifact is byte-identical to the scanned one —
-      # signing it in place gives "scanned == signed == shipped" and keeps
-      # staging (GHCR) purely unsigned. We sign in prod rather than sign-then-copy
-      # because a cross-registry signature copy is unreliable — the deprecated
-      # `cosign copy` doesn't carry the signature referrer.
-      - name: Promote — copy image to production
+      # Promote: copy the SIGNED artifact to production, digest-preserving. crane
+      # copies the exact signature/attestation tags — deterministic, no dependency
+      # on the OCI Referrers API in either registry (cosign writes legacy tag-based
+      # signatures by default, which oras -r / referrer copies would miss).
+      #
+      # Order matters: copy the signature + attestation FIRST, the image LAST. So
+      # production never holds a runnable image without its signature already
+      # present — the "only signed images live in prod" separation holds even if
+      # this job dies mid-copy. (An orphan .sig with no image is inert.)
+      - name: Promote — copy signed image to production
         env:
-          SRC: ${{ steps.digest.outputs.ref }}
-          DST: ${{ env.PROD }}:sha-${{ steps.digest.outputs.head_sha }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          DST_TAG: sha-${{ steps.digest.outputs.head_sha }}
         run: |
-          crane cp "$SRC" "$DST"
+          COSIGN_TAG="${DIGEST/:/-}"                          # sha256:<hex> -> sha256-<hex>
+          crane cp "$STAGING:${COSIGN_TAG}.sig" "$PROD:${COSIGN_TAG}.sig"
+          crane cp "$STAGING:${COSIGN_TAG}.att" "$PROD:${COSIGN_TAG}.att"
+          crane cp "$STAGING@$DIGEST"           "$PROD:$DST_TAG"   # image last
 
-      - name: Generate SBOM (Syft)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          image: ${{ env.PROD }}@${{ steps.digest.outputs.digest }}
-          format: spdx-json
-          output-file: sbom.spdx.json
-
-      # Keyless sign + SBOM attestation, minted on the PRODUCTION digest.
-      - name: Sign (keyless) + attest SBOM
-        env:
-          COSIGN_YES: "true" # non-interactive: consent to Rekor transparency-log entry
-          PROD_REF: ${{ env.PROD }}@${{ steps.digest.outputs.digest }}
-        run: |
-          cosign sign "$PROD_REF"
-          cosign attest --type spdxjson --predicate sbom.spdx.json "$PROD_REF"
-
-      - name: Verify signature in production
+      - name: Verify signature + SBOM attestation in production
         env:
           PROD_REF: ${{ env.PROD }}@${{ steps.digest.outputs.digest }}
         run: |
-          cosign verify \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release.yml@" \
-            "$PROD_REF"
+          IDENTITY_FLAGS=(
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release.yml@"
+          )
+          cosign verify "${IDENTITY_FLAGS[@]}" "$PROD_REF"
+          cosign verify-attestation --type spdxjson "${IDENTITY_FLAGS[@]}" "$PROD_REF"
           echo "**Promoted (SIGNED):** \`$PROD_REF\`" >> "$GITHUB_STEP_SUMMARY"
