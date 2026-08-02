@@ -92,8 +92,8 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      - name: Install crane
-        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+      - name: Install ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
 
       - name: Generate SBOM (Syft)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -103,8 +103,8 @@ jobs:
           output-file: sbom.spdx.json
 
       # Sign + attest in STAGING first, so only a SIGNED artifact is ever
-      # promoted. Cosign writes the signature/attestation as sibling tags next to
-      # the image: sha256-<hex>.sig and sha256-<hex>.att.
+      # promoted. Cosign (v4) attaches the signature and SBOM attestation as OCI
+      # referrers of the image digest — the copy step below carries them along.
       - name: Sign (keyless) + attest SBOM
         env:
           COSIGN_YES: "true" # non-interactive: consent to Rekor transparency-log entry
@@ -120,24 +120,19 @@ jobs:
           username: ${{ secrets.DOCR_TOKEN }} # DOCR uses the API token as both username and password
           password: ${{ secrets.DOCR_TOKEN }}
 
-      # Promote: copy the SIGNED artifact to production, digest-preserving. crane
-      # copies the exact signature/attestation tags — deterministic, no dependency
-      # on the OCI Referrers API in either registry (cosign writes legacy tag-based
-      # signatures by default, which oras -r / referrer copies would miss).
-      #
-      # Order matters: copy the signature + attestation FIRST, the image LAST. So
-      # production never holds a runnable image without its signature already
-      # present — the "only signed images live in prod" separation holds even if
-      # this job dies mid-copy. (An orphan .sig with no image is inert.)
+      # Promote the SIGNED artifact to production, digest-preserving. cosign (v4)
+      # stores the signature + SBOM attestation as OCI 1.1 REFERRERS of the image
+      # digest, so `oras cp -r` copies the image together with everything that
+      # refers to it — image + signature + attestation in one graph copy. Because
+      # we sign in staging first and only copy afterwards, an unsigned image is
+      # never promoted. (This is the tool cosign's own `copy` deprecation notice
+      # points to.)
       - name: Promote — copy signed image to production
         env:
           DIGEST: ${{ steps.digest.outputs.digest }}
           DST_TAG: sha-${{ steps.digest.outputs.head_sha }}
         run: |
-          COSIGN_TAG="${DIGEST/:/-}"                          # sha256:<hex> -> sha256-<hex>
-          crane cp "$STAGING:${COSIGN_TAG}.sig" "$PROD:${COSIGN_TAG}.sig"
-          crane cp "$STAGING:${COSIGN_TAG}.att" "$PROD:${COSIGN_TAG}.att"
-          crane cp "$STAGING@$DIGEST"           "$PROD:$DST_TAG"   # image last
+          oras cp -r "$STAGING@$DIGEST" "$PROD:$DST_TAG"
 
       - name: Verify signature + SBOM attestation in production
         env:
