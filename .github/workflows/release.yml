@@ -41,6 +41,7 @@ jobs:
   sign-promote:
     name: Sign & promote to production registry
     runs-on: ubuntu-latest
+    timeout-minutes: 10 # hard ceiling — a hung verify/copy can't burn the runner
     permissions:
       contents: read
       packages: write # read the staging image + write signature/attestation artifacts alongside it
@@ -134,14 +135,24 @@ jobs:
         run: |
           oras cp -r "$STAGING@$DIGEST" "$PROD:$DST_TAG"
 
-      - name: Verify signature + SBOM attestation in production
+      # Verify the signature + SBOM attestation, then confirm the artifact is in
+      # prod. We verify against the STAGING ref (GHCR): the signature/attestation
+      # are content-addressed to the digest and were copied verbatim to prod, so
+      # verifying them on GHCR proves the exact same artifacts are valid — while
+      # sidestepping DOCR's OCI Referrers API, whose discovery makes cosign hang
+      # after a successful verify (DOCR-side wart). Presence in prod is confirmed
+      # with a plain manifest fetch by digest (no referrer discovery). `timeout`
+      # is a belt-and-braces guard so verification can never wedge the runner.
+      - name: Verify signature + SBOM attestation
         env:
+          STAGING_REF: ${{ steps.digest.outputs.ref }}
           PROD_REF: ${{ env.PROD }}@${{ steps.digest.outputs.digest }}
         run: |
           IDENTITY_FLAGS=(
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
             --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release.yml@"
           )
-          cosign verify "${IDENTITY_FLAGS[@]}" "$PROD_REF"
-          cosign verify-attestation --type spdxjson "${IDENTITY_FLAGS[@]}" "$PROD_REF"
+          timeout 120 cosign verify "${IDENTITY_FLAGS[@]}" "$STAGING_REF"
+          timeout 120 cosign verify-attestation --type spdxjson "${IDENTITY_FLAGS[@]}" "$STAGING_REF" > /dev/null
+          oras manifest fetch "$PROD_REF" > /dev/null # confirm the signed image is present in prod
           echo "**Promoted (SIGNED):** \`$PROD_REF\`" >> "$GITHUB_STEP_SUMMARY"
