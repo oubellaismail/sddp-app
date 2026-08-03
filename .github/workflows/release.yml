@@ -42,6 +42,10 @@ jobs:
     name: Sign & promote to production registry
     runs-on: ubuntu-latest
     timeout-minutes: 10 # hard ceiling — a hung verify/copy can't burn the runner
+    # Expose the resolved digest so the update-config job can bump the config repo.
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+      head_sha: ${{ steps.digest.outputs.head_sha }}
     permissions:
       contents: read
       packages: write # read the staging image + write signature/attestation artifacts alongside it
@@ -156,3 +160,89 @@ jobs:
           timeout 120 cosign verify-attestation --type spdxjson "${IDENTITY_FLAGS[@]}" "$STAGING_REF" > /dev/null
           oras manifest fetch "$PROD_REF" > /dev/null # confirm the signed image is present in prod
           echo "**Promoted (SIGNED):** \`$PROD_REF\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # §3.12 — Update config repo. Open a PULL REQUEST against sddp-app-config
+  # bumping the backend image to the digest we just signed + promoted. PR, never
+  # a direct push (ADR-005, trust boundary D): a human merges it, and ArgoCD then
+  # rolls the new digest into the cluster. This job holds the pipeline's ONLY
+  # cross-repo write credential, isolated here away from sign-promote — a
+  # short-lived GitHub App installation token scoped to just sddp-app-config (no
+  # long-lived PAT, consistent with keyless signing / ADR-006). It cannot merge.
+  update-config:
+    name: Open config-repo PR (digest bump)
+    needs: sign-promote
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {} # zero authority over THIS repo; all writes go via the App token to sddp-app-config
+    env:
+      CONFIG_REPO: ${{ github.repository_owner }}/sddp-app-config
+      PROD: registry.digitalocean.com/sddp-registry/sddp-backend
+      DIGEST: ${{ needs.sign-promote.outputs.digest }}
+      SOURCE_SHA: ${{ needs.sign-promote.outputs.head_sha }}
+      DEPLOYMENT: manifests/backend/deployment.yaml
+    steps:
+      # Mint a ~1h installation token scoped to just the config repo.
+      - name: Mint GitHub App token (config repo)
+        id: apptoken
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CONFIG_BOT_APP_ID }}
+          private-key: ${{ secrets.CONFIG_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: sddp-app-config
+
+      - name: Checkout config repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.CONFIG_REPO }}
+          token: ${{ steps.apptoken.outputs.token }}
+
+      - name: Bump backend digest + open PR
+        env:
+          GH_TOKEN: ${{ steps.apptoken.outputs.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          NEWHEX="${DIGEST#sha256:}"
+          NEW_IMAGE="${PROD}@${DIGEST}"
+
+          # Surgical digest replace — anchored to the backend repo + a 64-hex
+          # digest, so all comments and formatting in the manifest survive (safer
+          # than yq rewriting a heavily-commented file).
+          sed -i -E "s#(sddp-backend@sha256:)[0-9a-f]{64}#\1${NEWHEX}#" "$DEPLOYMENT"
+
+          # Never open an empty PR: if the digest is already current, stop.
+          if git diff --quiet -- "$DEPLOYMENT"; then
+            echo "Config repo already at ${NEW_IMAGE} — no PR needed."
+            echo "**No change:** config already at \`${NEW_IMAGE}\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          BRANCH="bump-backend-${NEWHEX:0:12}"
+          # Re-run safety: if the branch already exists, a PR for this exact digest
+          # is presumably open already — skip rather than error.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Branch ${BRANCH} already exists — PR presumably open; skipping."
+            exit 0
+          fi
+
+          git config user.name  "sddp-release[bot]"
+          git config user.email "sddp-release[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git commit -am "chore: bump backend image to ${NEWHEX:0:12}"
+          git push origin "$BRANCH"
+
+          BODY=$(printf '%s\n' \
+            "Automated digest bump from the \`sddp-app\` release pipeline (§3.12)." \
+            "" \
+            "- **New image:** \`${NEW_IMAGE}\`" \
+            "- **Source commit (sddp-app):** \`${SOURCE_SHA}\`" \
+            "- **Release run:** ${RUN_URL}" \
+            "" \
+            "Scanned, keyless-signed (Cosign/Sigstore) and promoted to DOCR by that run; POL-01 verifies the signature at admission. Review and merge to deploy via ArgoCD.")
+
+          gh pr create --repo "$CONFIG_REPO" --base main --head "$BRANCH" \
+            --title "chore: bump backend image to ${NEWHEX:0:12}" \
+            --body "$BODY"
+
+          echo "**Opened config PR** for \`${NEW_IMAGE}\`." >> "$GITHUB_STEP_SUMMARY"
