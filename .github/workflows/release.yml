@@ -1,20 +1,25 @@
-# Release — sign & promote (runs post-merge, i.e. post-gate).
+# Release — sign & promote (runs post-merge, i.e. post-gate). MULTI-IMAGE.
 #
-# On merge to main, the exact image that was built and scanned on the PR is
-# signed and promoted — never rebuilt. Trust acts happen only here, after the
-# full gate (all checks + merge) has passed: sign an artifact any earlier and
-# we'd be certifying trust that hasn't been earned yet.
+# On merge to main, the exact images built and scanned on the PR are signed and
+# promoted — never rebuilt. A MATRIX over {backend, frontend} runs the same
+# trust acts per tier; each leg is byte-identical to the proven single-image
+# flow, only parameterized. Trust acts happen only here, after the full gate
+# (all checks + merge): signing earlier would certify trust not yet earned.
 #
-# Flow: resolve the scanned digest -> SBOM -> keyless sign + attest -> copy the
-# signed digest (with signature + attestations) from the staging registry to the
-# production registry, then verify. Staging holds unsigned build/scan artifacts;
-# the production registry receives ONLY signed digests and is the only registry
-# the cluster pulls from.
+# Per tier: resolve the scanned digest -> SBOM -> keyless sign + attest -> copy
+# the signed digest (with signature + attestations) from staging (GHCR) to prod
+# (DOCR), then verify. Staging holds unsigned build/scan artifacts; prod receives
+# ONLY signed digests and is the only registry the cluster pulls from.
 #
 # Keyless signing (Sigstore): the workflow's OIDC identity gets a short-lived
-# Fulcio certificate and the signing event is logged in Rekor — no long-lived
-# private key. Admission verification later pins this exact identity (issuer +
-# subject), so keep the workflow filename/ref stable.
+# Fulcio cert; the signing event is logged in Rekor — no long-lived key. Admission
+# verification pins this exact identity (issuer + subject), so keep the workflow
+# filename/ref stable.
+#
+# The digest of each promoted tier is handed to the config-bump job via a small
+# artifact. That job is TOLERANT: it bumps only tiers whose manifest already
+# exists in the config repo, so a newly-added tier (frontend, before its manifest
+# lands) is signed + promoted now and wired into delivery in a follow-up.
 #
 # Actions are pinned to commit SHAs — a moved tag can't swap the action out.
 
@@ -26,7 +31,7 @@ on:
   workflow_dispatch:
     inputs:
       head_sha:
-        description: "Commit SHA whose staging image to sign/promote (defaults to auto-resolving from the merge commit's PR)"
+        description: "Commit SHA whose staging images to sign/promote (defaults to auto-resolving from the merge commit's PR)"
         required: false
 
 permissions:
@@ -39,12 +44,16 @@ concurrency:
 
 jobs:
   sign-promote:
-    name: Sign & promote to production registry
+    name: Sign & promote to production registry (${{ matrix.image }})
     runs-on: ubuntu-latest
     timeout-minutes: 10 # hard ceiling — a hung verify/copy can't burn the runner
-    # Expose the resolved digest so the update-config job can bump the config repo.
+    strategy:
+      fail-fast: false # one tier failing must not abort the other's promotion
+      matrix:
+        image: [backend, frontend]
+    # head_sha is identical across legs (same PR), so exposing it as a job output
+    # is safe despite matrix overwrite. Per-tier digests travel via artifacts.
     outputs:
-      digest: ${{ steps.digest.outputs.digest }}
       head_sha: ${{ steps.digest.outputs.head_sha }}
     permissions:
       contents: read
@@ -52,8 +61,8 @@ jobs:
       id-token: write # keyless OIDC signing (Fulcio short-lived cert)
       pull-requests: read # resolve the merge commit's PR -> head SHA
     env:
-      STAGING: ghcr.io/${{ github.repository_owner }}/sddp-backend
-      PROD: registry.digitalocean.com/sddp-registry/sddp-backend
+      STAGING: ghcr.io/${{ github.repository_owner }}/sddp-${{ matrix.image }}
+      PROD: registry.digitalocean.com/sddp-registry/sddp-${{ matrix.image }}
     steps:
       - name: Log in to staging registry (GHCR)
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
@@ -62,11 +71,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Resolve the EXACT digest built + scanned on the PR. A merge/squash makes
-      # a new commit SHA, so github.sha won't match the PR's `sha-<head>` tag —
-      # recover the head SHA from the merge commit's associated PR, then look up
-      # the immutable digest for that tag. No rebuild: content is addressed by
-      # digest, so this is provably the artifact that was scanned.
+      # Resolve the EXACT digest built + scanned on the PR for THIS tier. A merge/
+      # squash makes a new commit SHA, so github.sha won't match the PR's
+      # `sha-<head>` tag — recover the head SHA from the merge commit's associated
+      # PR, then look up the immutable digest for that tier's tag. No rebuild.
       - name: Resolve scanned digest
         id: digest
         env:
@@ -130,8 +138,7 @@ jobs:
       # digest, so `oras cp -r` copies the image together with everything that
       # refers to it — image + signature + attestation in one graph copy. Because
       # we sign in staging first and only copy afterwards, an unsigned image is
-      # never promoted. (This is the tool cosign's own `copy` deprecation notice
-      # points to.)
+      # never promoted.
       - name: Promote — copy signed image to production
         env:
           DIGEST: ${{ steps.digest.outputs.digest }}
@@ -144,9 +151,9 @@ jobs:
       # are content-addressed to the digest and were copied verbatim to prod, so
       # verifying them on GHCR proves the exact same artifacts are valid — while
       # sidestepping DOCR's OCI Referrers API, whose discovery makes cosign hang
-      # after a successful verify (DOCR-side wart). Presence in prod is confirmed
-      # with a plain manifest fetch by digest (no referrer discovery). `timeout`
-      # is a belt-and-braces guard so verification can never wedge the runner.
+      # after a successful verify. Presence in prod is confirmed with a plain
+      # manifest fetch by digest (no referrer discovery). `timeout` is a
+      # belt-and-braces guard so verification can never wedge the runner.
       - name: Verify signature + SBOM attestation
         env:
           STAGING_REF: ${{ steps.digest.outputs.ref }}
@@ -161,13 +168,28 @@ jobs:
           oras manifest fetch "$PROD_REF" > /dev/null # confirm the signed image is present in prod
           echo "**Promoted (SIGNED):** \`$PROD_REF\`" >> "$GITHUB_STEP_SUMMARY"
 
-  # §3.12 — Update config repo. Open a PULL REQUEST against sddp-app-config
-  # bumping the backend image to the digest we just signed + promoted. PR, never
-  # a direct push (ADR-005, trust boundary D): a human merges it, and ArgoCD then
-  # rolls the new digest into the cluster. This job holds the pipeline's ONLY
-  # cross-repo write credential, isolated here away from sign-promote — a
-  # short-lived GitHub App installation token scoped to just sddp-app-config (no
-  # long-lived PAT, consistent with keyless signing / ADR-006). It cannot merge.
+      # Hand this tier's promoted digest to the config-bump job. Keyed per tier so
+      # download-artifact can merge both without collision.
+      - name: Record promoted digest
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          mkdir -p out
+          echo "$DIGEST" > "out/${{ matrix.image }}.digest"
+      - name: Upload promoted digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: promoted-digest-${{ matrix.image }}
+          path: out/${{ matrix.image }}.digest
+
+  # §3.12 — Update config repo. Open ONE PULL REQUEST against sddp-app-config
+  # bumping every tier we just signed + promoted AND that already has a manifest.
+  # PR, never a direct push (ADR-005, trust boundary D): a human merges it, and
+  # ArgoCD then rolls the new digests into the cluster. This job holds the
+  # pipeline's ONLY cross-repo write credential, isolated here away from
+  # sign-promote — a short-lived GitHub App installation token scoped to just
+  # sddp-app-config (no long-lived PAT, consistent with keyless signing). It
+  # cannot merge.
   update-config:
     name: Open config-repo PR (digest bump)
     needs: sign-promote
@@ -176,10 +198,8 @@ jobs:
     permissions: {} # zero authority over THIS repo; all writes go via the App token to sddp-app-config
     env:
       CONFIG_REPO: ${{ github.repository_owner }}/sddp-app-config
-      PROD: registry.digitalocean.com/sddp-registry/sddp-backend
-      DIGEST: ${{ needs.sign-promote.outputs.digest }}
+      PROD_BASE: registry.digitalocean.com/sddp-registry
       SOURCE_SHA: ${{ needs.sign-promote.outputs.head_sha }}
-      DEPLOYMENT: manifests/backend/deployment.yaml
     steps:
       # Mint a ~1h installation token scoped to just the config repo.
       - name: Mint GitHub App token (config repo)
@@ -197,30 +217,52 @@ jobs:
           repository: ${{ env.CONFIG_REPO }}
           token: ${{ steps.apptoken.outputs.token }}
 
-      - name: Bump backend digest + open PR
+      # Pull both tiers' promoted digests (merge-multiple flattens them into one
+      # dir: backend.digest, frontend.digest).
+      - name: Download promoted digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: promoted-digest-*
+          merge-multiple: true
+          path: digests
+
+      - name: Bump tier digests + open PR
         env:
           GH_TOKEN: ${{ steps.apptoken.outputs.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          NEWHEX="${DIGEST#sha256:}"
-          NEW_IMAGE="${PROD}@${DIGEST}"
 
-          # Surgical digest replace — anchored to the backend repo + a 64-hex
-          # digest, so all comments and formatting in the manifest survive (safer
-          # than yq rewriting a heavily-commented file).
-          sed -i -E "s#(sddp-backend@sha256:)[0-9a-f]{64}#\1${NEWHEX}#" "$DEPLOYMENT"
+          BUMPED=""
+          for TIER in backend frontend; do
+            DFILE="digests/${TIER}.digest"
+            DEPLOY="manifests/${TIER}/deployment.yaml"
+            # Tolerant: a tier signed+promoted but not yet delivered (no manifest)
+            # is simply skipped — it gets wired into delivery in a follow-up PR.
+            [ -f "$DFILE" ] || { echo "No promoted digest for ${TIER} — skipping."; continue; }
+            [ -f "$DEPLOY" ] || { echo "No manifest for ${TIER} yet — skipping bump."; continue; }
+            DIGEST="$(cat "$DFILE")"
+            NEWHEX="${DIGEST#sha256:}"
+            # Surgical digest replace — anchored to the tier's repo + a 64-hex
+            # digest, so comments/formatting survive (safer than yq rewriting a
+            # heavily-commented file).
+            sed -i -E "s#(sddp-${TIER}@sha256:)[0-9a-f]{64}#\1${NEWHEX}#" "$DEPLOY"
+            if ! git diff --quiet -- "$DEPLOY"; then
+              BUMPED="${BUMPED} ${TIER}:${NEWHEX:0:12}"
+            fi
+          done
 
-          # Never open an empty PR: if the digest is already current, stop.
-          if git diff --quiet -- "$DEPLOYMENT"; then
-            echo "Config repo already at ${NEW_IMAGE} — no PR needed."
-            echo "**No change:** config already at \`${NEW_IMAGE}\`." >> "$GITHUB_STEP_SUMMARY"
+          # Never open an empty PR: if nothing changed, stop.
+          if [ -z "$BUMPED" ]; then
+            echo "Config repo already current for all delivered tiers — no PR needed."
+            echo "**No change:** config already at the promoted digest(s)." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          BRANCH="bump-backend-${NEWHEX:0:12}"
-          # Re-run safety: if the branch already exists, a PR for this exact digest
-          # is presumably open already — skip rather than error.
+          # Branch name keyed by the source commit (stable per release run).
+          BRANCH="bump-images-${SOURCE_SHA:0:12}"
+          # Re-run safety: if the branch already exists, a PR for this release is
+          # presumably open already — skip rather than error.
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
             echo "Branch ${BRANCH} already exists — PR presumably open; skipping."
             exit 0
@@ -229,20 +271,20 @@ jobs:
           git config user.name  "sddp-release[bot]"
           git config user.email "sddp-release[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git commit -am "chore: bump backend image to ${NEWHEX:0:12}"
+          git commit -am "chore: bump image digests -${BUMPED}"
           git push origin "$BRANCH"
 
           BODY=$(printf '%s\n' \
             "Automated digest bump from the \`sddp-app\` release pipeline (§3.12)." \
             "" \
-            "- **New image:** \`${NEW_IMAGE}\`" \
+            "- **Bumped tiers:**${BUMPED}" \
             "- **Source commit (sddp-app):** \`${SOURCE_SHA}\`" \
             "- **Release run:** ${RUN_URL}" \
             "" \
-            "Scanned, keyless-signed (Cosign/Sigstore) and promoted to DOCR by that run; POL-01 verifies the signature at admission. Review and merge to deploy via ArgoCD.")
+            "Each tier was scanned, keyless-signed (Cosign/Sigstore) and promoted to DOCR by that run; POL-01 verifies the signature at admission. Review and merge to deploy via ArgoCD.")
 
           gh pr create --repo "$CONFIG_REPO" --base main --head "$BRANCH" \
-            --title "chore: bump backend image to ${NEWHEX:0:12}" \
+            --title "chore: bump image digests -${BUMPED}" \
             --body "$BODY"
 
-          echo "**Opened config PR** for \`${NEW_IMAGE}\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "**Opened config PR** bumping:${BUMPED}." >> "$GITHUB_STEP_SUMMARY"
