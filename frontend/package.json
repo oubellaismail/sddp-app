@@ -1,0 +1,16 @@
+{
+  "name": "sddp-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SDDP demo frontend service — front tier (frontend -> backend -> db).",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
