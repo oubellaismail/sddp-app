@@ -6,12 +6,11 @@ CI/CD (scan, build, sign) is defined here. Deployment manifests live separately 
 
 ## Layout
 
-Monorepo for the first-party tiers of the demo app:
+Source for the backend service of the demo app:
 
-- `backend/` — Node/Express HTTP API, the middle tier (frontend → backend → db).
-- `frontend/` — thin web tier that calls the backend (added once the backend pipeline is proven).
+- `backend/` — Node/Express HTTP API (the middle tier: frontend → backend → db).
 
-The database tier is a stock upstream image (not built here); it is admitted via the platform's trusted-registry allowlist.
+The frontend is a separate service with its own repository. The database tier is a stock upstream image (not built here); it is admitted via the platform's trusted-registry allowlist.
 
 ## Secret scanning (pre-commit)
 
